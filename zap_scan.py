@@ -5,7 +5,7 @@ import requests
 from zapv2 import ZAPv2
 
 print("="*60)
-print("OWASP ZAP SCAN - Titan App (MODO COMPLETO)")
+print("OWASP ZAP SCAN - Titan App (MODO COMPLETO - TIEMPO EXTENDIDO)")
 print("="*60)
 
 api_key = os.environ.get('ZAP_API_KEY', '')
@@ -110,17 +110,24 @@ for i in range(12):
     time.sleep(5)
 
 # ============================================
-# ESCANEO ACTIVO (profundo)
+# ESCANEO ACTIVO CON TIEMPO EXTENDIDO
 # ============================================
 print("[6] Iniciando escaneo activo (ataques simulados)...")
+print("    ⚠️  Este proceso puede tomar varios minutos...")
 zap.ascan.scan(target, recurse=True, inscopeonly=False)
-time.sleep(5)
-for i in range(30):  # Más tiempo para escaneo profundo
+time.sleep(10)
+
+# ESPERAR HASTA QUE EL ESCANEO ESTÉ COMPLETO (CON TIMEOUT DE 10 MINUTOS)
+max_iterations = 60  # 60 iteraciones * 10 segundos = 10 minutos máximo
+for i in range(max_iterations):
     status = zap.ascan.status()
-    print(f"    Escaneo activo: {status}%")
+    print(f"    Escaneo activo: {status}% completado")
     if status == '100':
+        print("    ✅ Escaneo activo completado")
         break
-    time.sleep(10)  # Esperar más entre verificaciones
+    if i == max_iterations - 1:
+        print("    ⚠️ Tiempo máximo de escaneo alcanzado (10 minutos)")
+    time.sleep(10)
 
 # ============================================
 # OBTENER ALERTAS
@@ -142,6 +149,12 @@ if high_alerts:
     print("\n🔴 ALERTAS HIGH ENCONTRADAS:")
     for alert in high_alerts:
         print(f"  • {alert.get('alert')} - {alert.get('url')}")
+else:
+    print("\n⚠️ No se encontraron alertas HIGH.")
+    print("   Posibles razones:")
+    print("   • El escaneo activo no tuvo tiempo suficiente para completarse")
+    print("   • Las rutas vulnerables requieren autenticación específica")
+    print("   • Los payloads de SQLi/RCE necesitan más tiempo")
 
 # ============================================
 # GENERAR REPORTE HTML
@@ -183,6 +196,7 @@ html_content = f"""<!DOCTYPE html>
         <p><strong>Target:</strong> {target}</p>
         <p><strong>Fecha:</strong> {time.strftime('%Y-%m-%d %H:%M:%S')}</p>
         <p><strong>Autenticación:</strong> {'✅ Configurada' if 'token' in locals() else '❌ No configurada'}</p>
+        <p><strong>Tiempo de escaneo:</strong> {'Completado' if status == '100' else 'Parcial'}</p>
         
         <div class="summary">
             <div class="stat stat-high">
@@ -221,7 +235,7 @@ if high_alerts:
         </div>
         """
 else:
-    html_content += "<p>⚠️ No se encontraron vulnerabilidades HIGH. Esto puede indicar que el escaneo no fue suficientemente profundo o que la autenticación falló.</p>"
+    html_content += "<p>⚠️ No se encontraron vulnerabilidades HIGH. Esto puede deberse a tiempo de escaneo insuficiente.</p>"
 
 html_content += f"""
         <h2>🟡 Alertas de Riesgo Medio (MEDIUM) - {len(medium_alerts)} encontradas</h2>
@@ -260,11 +274,12 @@ else:
     html_content += "<p>No se encontraron vulnerabilidades de riesgo bajo.</p>"
 
 html_content += f"""
-        <h2>📊 Recomendaciones para mejorar el escaneo</h2>
+        <h2>📊 Diagnóstico del escaneo</h2>
         <ul>
-            <li>🔐 <strong>Autenticación:</strong> {'Configurada correctamente' if 'token' in locals() else 'No se pudo autenticar - las rutas protegidas no se escanearán'}</li>
-            <li>⚡ <strong>Tiempo de escaneo:</strong> Aumentar el número de iteraciones para detectar más vulnerabilidades</li>
-            <li>🎯 <strong>Rutas críticas:</strong> /api/shipping/track (SQLi), /api/admin/system/diagnostics (RCE), /api/auth/profile (IDOR)</li>
+            <li>🔐 <strong>Autenticación:</strong> {'✅ Configurada' if 'token' in locals() else '❌ No configurada'}</li>
+            <li>⏱️ <strong>Tiempo de escaneo activo:</strong> {status}% completado</li>
+            <li>🎯 <strong>Rutas que requieren más tiempo:</strong> /api/shipping/track (SQLi), /api/admin/system/diagnostics (RCE)</li>
+            <li>💡 <strong>Recomendación:</strong> Aumentar el tiempo de escaneo a 15-20 minutos para detectar SQLi</li>
         </ul>
         
         <div class="timestamp">
@@ -292,17 +307,11 @@ else:
 print("\n" + "="*60)
 if len(high_alerts) > 0:
     print(f"❌ PIPELINE FALLIDO: {len(high_alerts)} vulnerabilidades HIGH encontradas")
-    print(f"    SQL Injection, RCE y otras vulnerabilidades detectadas")
-    for alert in high_alerts[:5]:
-        print(f"     • {alert.get('alert', 'N/A')}")
+    print(f"    SQL Injection y otras vulnerabilidades detectadas")
     sys.exit(1)
 else:
     print("⚠️  ADVERTENCIA: No se encontraron vulnerabilidades HIGH")
-    print("    Posibles causas:")
-    print("    - La autenticación no funcionó correctamente")
-    print("    - El escaneo fue demasiado superficial")
-    print("    - ZAP necesita más tiempo para detectar SQLi complejas")
-    print("\n    Revisa el reporte HTML para ver alertas MEDIUM/LOW")
-    sys.exit(0)  # Cambia a 1 si quieres que falle siempre
-    print("✅ PIPELINE EXITOSO: No hay vulnerabilidades HIGH")
+    print("    Esto puede deberse a tiempo insuficiente de escaneo")
+    print("    El escaneo solo alcanzó el {status}% de completitud")
+    print("\n    Revisa el reporte HTML para más detalles")
     sys.exit(0)
