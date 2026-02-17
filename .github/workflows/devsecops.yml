@@ -1,4 +1,4 @@
-name: DevSecOps Pipeline - Titan
+name: DevSecOps Pipeline - Titan (COMPLETO)
 
 on:
   push:
@@ -18,14 +18,14 @@ jobs:
           fetch-depth: 0
 
       # ============================================
-      # GITLEAKS - Escaneo de secretos
+      # GITLEAKS
       # ============================================
       - name: Gitleaks
         uses: zricethezav/gitleaks-action@v1.6.0
         continue-on-error: true
 
       # ============================================
-      # SNYK - Análisis de dependencias
+      # SNYK
       # ============================================
       - name: Install system dependencies and Snyk
         run: |
@@ -54,7 +54,7 @@ jobs:
           SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
 
       # ============================================
-      # SONARCLOUD - Análisis estático (CORREGIDO)
+      # SONARCLOUD (con análisis manual)
       # ============================================
       - name: SonarCloud Scan
         id: sonar
@@ -72,17 +72,18 @@ jobs:
             -Dsonar.exclusions=**/tests/**,**/venv/**,**/__pycache__/**
 
       # ============================================
-      # ZAP - Análisis dinámico (CON DEPURACIÓN)
+      # ZAP - VERSIÓN MEJORADA
       # ============================================
       - name: Setup Python
         uses: actions/setup-python@v4
         with:
           python-version: '3.9'
 
-      - name: Install ZAP API
-        run: pip install python-owasp-zap-v2.4
+      - name: Install dependencies for ZAP
+        run: |
+          pip install python-owasp-zap-v2.4 requests
 
-      - name: Build and Run Titan App (CON LOGS)
+      - name: Build and Run Titan App
         run: |
           echo "🔨 Construyendo imagen Docker..."
           docker build -t titan-app .
@@ -96,24 +97,23 @@ jobs:
           sleep 30
           
           echo "📋 LOGS DEL CONTENEDOR:"
-          docker logs titan-app || echo "❌ No se pudieron obtener logs"
+          docker logs titan-app
           
           echo "🔍 Verificando que la app responde..."
-          curl -v http://localhost:5000 || echo "❌ App no responde - revisa logs arriba"
-          
-          echo "✅ Paso completado (con o sin app)"
+          curl -I http://localhost:5000 || echo "⚠️ App no responde"
 
       - name: Run ZAP
         run: |
           docker run -d --name zap --network host -v $(pwd):/zap/wrk:rw \
             zaproxy/zap-stable \
             zap.sh -daemon -host 0.0.0.0 -port 8080 \
-            -config api.key=${{ secrets.ZAP_API_KEY }}
-          echo "⏳ Esperando 30 segundos a que ZAP arranque..."
-          sleep 30
+            -config api.key=${{ secrets.ZAP_API_KEY }} \
+            -config api.disablekey=true
+          echo "⏳ Esperando 45 segundos a que ZAP arranque..."
+          sleep 45
           echo "✅ ZAP corriendo en http://localhost:8080"
 
-      - name: ZAP Scan
+      - name: ZAP Scan (Completo)
         id: zap
         run: python zap_scan.py
         continue-on-error: true
@@ -121,7 +121,7 @@ jobs:
           ZAP_API_KEY: ${{ secrets.ZAP_API_KEY }}
 
       # ============================================
-      # ARTIFACTS - SUBIR REPORTES
+      # ARTIFACTS
       # ============================================
       - name: Upload Snyk Report
         if: always()
@@ -135,18 +135,67 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: zap-report
+          name: zap-report-completo
           path: zap-report.html
           if-no-files-found: warn
 
       # ============================================
-      # NOTIFICACIÓN FINAL
+      # VERIFICACIÓN FINAL
+      # ============================================
+      - name: Verificar resultados
+        if: always()
+        run: |
+          EXIT_CODE=0
+          
+          echo "=== RESUMEN DE SEGURIDAD ==="
+          echo ""
+          
+          # Gitleaks
+          if [[ "${{ steps.gitleaks.outcome }}" == "failure" ]]; then
+            echo "❌ Gitleaks: Se encontraron secretos"
+            EXIT_CODE=1
+          else
+            echo "✅ Gitleaks: No hay secretos"
+          fi
+          
+          # Snyk
+          if [[ "${{ steps.snyk.outcome }}" == "failure" ]]; then
+            echo "❌ Snyk: Vulnerabilidades HIGH en dependencias"
+            EXIT_CODE=1
+          else
+            echo "✅ Snyk: No hay vulnerabilidades HIGH"
+          fi
+          
+          # SonarCloud
+          if [[ "${{ steps.sonar.outcome }}" == "failure" ]]; then
+            echo "❌ SonarCloud: Calidad de código deficiente (revisar)"
+            EXIT_CODE=1
+          else
+            echo "✅ SonarCloud: Quality Gate OK"
+          fi
+          
+          # ZAP
+          if [[ "${{ steps.zap.outcome }}" == "failure" ]]; then
+            echo "❌ ZAP: Se encontraron vulnerabilidades HIGH"
+            EXIT_CODE=1
+          else
+            echo "⚠️ ZAP: No se encontraron HIGH (revisar reporte)"
+          fi
+          
+          echo ""
+          echo "📊 Reportes disponibles en Artifacts"
+          echo ""
+          
+          exit $EXIT_CODE
+
+      # ============================================
+      # NOTIFICACIÓN
       # ============================================
       - name: Notificación
         if: always()
         run: |
           echo "========================================"
           echo "🚀 Pipeline Titan completado"
-          echo "📊 Reportes disponibles en artifacts"
-          echo "📌 Ver SonarCloud: https://sonarcloud.io/project/overview?id=negrete-8_negrete2"
+          echo "📊 Reportes en Actions → Artifacts"
+          echo "📌 SonarCloud: https://sonarcloud.io/project/overview?id=negrete-8_negrete2"
           echo "========================================"
