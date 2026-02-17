@@ -1,0 +1,150 @@
+name: DevSecOps Pipeline
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+
+jobs:
+  security-pipeline:
+    runs-on: ubuntu-latest
+    # 🔵 EJECUTA TODOS LOS ESCÁNERES AUNQUE ALGUNO FALLE
+    continue-on-error: true
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+
+      # ============================================
+      # GITLEAKS - Escaneo de secretos
+      # ============================================
+      - name: Gitleaks
+        uses: zricethezav/gitleaks-action@v1.6.0
+        continue-on-error: true
+
+      # ============================================
+      # SNYK - Análisis de dependencias
+      # ============================================
+      - name: Install system dependencies and Snyk
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libjpeg-dev zlib1g-dev
+          pip install --no-cache-dir -r requirements.txt
+          npm install -g snyk
+
+      - name: Snyk Test
+        id: snyk
+        run: snyk test --severity-threshold=high
+        continue-on-error: true
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+
+      - name: Install snyk-to-html
+        if: always()
+        run: npm install -g snyk-to-html@1.4.0
+
+      - name: Generate Snyk HTML Report
+        if: always()
+        run: |
+          snyk test --severity-threshold=high --json > snyk-report.json || true
+          snyk-to-html -i snyk-report.json -o snyk-report.html || true
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+
+      # ============================================
+      # SONARCLOUD - Análisis estático
+      # ============================================
+      - name: SonarCloud Scan
+        id: sonar
+        uses: sonarsource/sonarqube-scan-action@master
+        continue-on-error: true
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        with:
+          args: >
+            -Dsonar.host.url=https://sonarcloud.io
+            -Dsonar.organization=negrete-8
+            -Dsonar.projectKey=negrete-8_titan
+            -Dsonar.sources=.
+            -Dsonar.python.version=3.9
+            -Dsonar.exclusions=**/tests/**,**/venv/**,**/__pycache__/**
+
+      # ============================================
+      # ZAP - Análisis dinámico
+      # ============================================
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.9'
+
+      - name: Install ZAP API
+        run: pip install python-owasp-zap-v2.4
+
+      # 🔵 CONSTRUIR Y EJECUTAR LA APLICACIÓN TITAN
+      - name: Build and Run Titan App
+        run: |
+          # Construir imagen Docker (asumiendo que hay Dockerfile)
+          docker build -t titan-app .
+          
+          # Ejecutar contenedor en modo host
+          docker run -d --name titan-app --network host \
+            -e TITAN_ID="github-action-$(date +%s)" \
+            titan-app
+          
+          echo "⏳ Esperando 30 segundos a que la app arranque..."
+          sleep 30
+          echo "✅ Titan App corriendo en http://localhost:5000"
+          
+          # Verificar que responde
+          curl -I http://localhost:5000 || echo "⚠️ App no responde, pero continuamos..."
+
+      - name: Run ZAP
+        run: |
+          docker run -d --name zap --network host -v $(pwd):/zap/wrk:rw \
+            zaproxy/zap-stable \
+            zap.sh -daemon -host 0.0.0.0 -port 8080 \
+            -config api.key=${{ secrets.ZAP_API_KEY }}
+          echo "⏳ Esperando 30 segundos a que ZAP arranque..."
+          sleep 30
+          echo "✅ ZAP corriendo en http://localhost:8080"
+
+      - name: ZAP Scan
+        id: zap
+        run: python zap_scan.py
+        continue-on-error: true
+        env:
+          ZAP_API_KEY: ${{ secrets.ZAP_API_KEY }}
+
+      # ============================================
+      # ARTIFACTS - SUBIR REPORTES
+      # ============================================
+      - name: Upload Snyk Report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: snyk-report
+          path: snyk-report.html
+          if-no-files-found: warn
+
+      - name: Upload ZAP Report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: zap-report
+          path: zap-report.html
+          if-no-files-found: warn
+
+      # ============================================
+      # NOTIFICACIÓN FINAL
+      # ============================================
+      - name: Notificación
+        if: always()
+        run: |
+          echo "========================================"
+          echo "🚀 Pipeline Titan completado"
+          echo "📊 Reportes disponibles en artifacts"
+          echo "📌 Ver SonarCloud: https://sonarcloud.io/project/overview?id=negrete-8_titan"
+          echo "========================================"
