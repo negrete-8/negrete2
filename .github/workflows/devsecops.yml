@@ -1,4 +1,4 @@
-name: DevSecOps Pipeline
+name: DevSecOps Pipeline - Titan
 
 on:
   push:
@@ -9,7 +9,6 @@ on:
 jobs:
   security-pipeline:
     runs-on: ubuntu-latest
-    # 🔵 EJECUTA TODOS LOS ESCÁNERES AUNQUE ALGUNO FALLE
     continue-on-error: true
 
     steps:
@@ -55,7 +54,7 @@ jobs:
           SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
 
       # ============================================
-      # SONARCLOUD - Análisis estático
+      # SONARCLOUD - Análisis estático (CORREGIDO)
       # ============================================
       - name: SonarCloud Scan
         id: sonar
@@ -67,13 +66,13 @@ jobs:
           args: >
             -Dsonar.host.url=https://sonarcloud.io
             -Dsonar.organization=negrete-8
-            -Dsonar.projectKey=negrete-8_titan
+            -Dsonar.projectKey=negrete-8_negrete2
             -Dsonar.sources=.
             -Dsonar.python.version=3.9
             -Dsonar.exclusions=**/tests/**,**/venv/**,**/__pycache__/**
 
       # ============================================
-      # ZAP - Análisis dinámico
+      # ZAP - Análisis dinámico (CON DEPURACIÓN)
       # ============================================
       - name: Setup Python
         uses: actions/setup-python@v4
@@ -83,23 +82,26 @@ jobs:
       - name: Install ZAP API
         run: pip install python-owasp-zap-v2.4
 
-      # 🔵 CONSTRUIR Y EJECUTAR LA APLICACIÓN TITAN
-      - name: Build and Run Titan App
+      - name: Build and Run Titan App (CON LOGS)
         run: |
-          # Construir imagen Docker (asumiendo que hay Dockerfile)
+          echo "🔨 Construyendo imagen Docker..."
           docker build -t titan-app .
           
-          # Ejecutar contenedor en modo host
+          echo "🚀 Ejecutando contenedor..."
           docker run -d --name titan-app --network host \
             -e TITAN_ID="github-action-$(date +%s)" \
             titan-app
           
           echo "⏳ Esperando 30 segundos a que la app arranque..."
           sleep 30
-          echo "✅ Titan App corriendo en http://localhost:5000"
           
-          # Verificar que responde
-          curl -I http://localhost:5000 || echo "⚠️ App no responde, pero continuamos..."
+          echo "📋 LOGS DEL CONTENEDOR:"
+          docker logs titan-app || echo "❌ No se pudieron obtener logs"
+          
+          echo "🔍 Verificando que la app responde..."
+          curl -v http://localhost:5000 || echo "❌ App no responde - revisa logs arriba"
+          
+          echo "✅ Paso completado (con o sin app)"
 
       - name: Run ZAP
         run: |
@@ -146,5 +148,5 @@ jobs:
           echo "========================================"
           echo "🚀 Pipeline Titan completado"
           echo "📊 Reportes disponibles en artifacts"
-          echo "📌 Ver SonarCloud: https://sonarcloud.io/project/overview?id=negrete-8_titan"
+          echo "📌 Ver SonarCloud: https://sonarcloud.io/project/overview?id=negrete-8_negrete2"
           echo "========================================"
