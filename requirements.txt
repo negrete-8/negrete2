@@ -3,5 +3,5 @@ Werkzeug==1.0.1
 Jinja2==3.0.3
 itsdangerous==1.1.0
 MarkupSafe==2.0.1
-PyYAML==3.13
+PyYAML==6.0.2
 requests==2.24.0
