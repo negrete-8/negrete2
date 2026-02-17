@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Dashboard - TitanCore</title>
+    <style>body{font-family:sans-serif; padding:20px;} .card{border:1px solid #ccc; padding:15px; margin-bottom:10px; border-radius:5px;}</style>
+</head>
+<body>
+    <h1>Bienvenido, {{ user.u }} (Rol: {{ user.role }})</h1>
+    <hr>
+    <h3>Rastreador de Envíos</h3>
+    <form action="/api/shipping/track" method="GET" target="result">
+        Código: <input name="code" placeholder="TRK-99-XA">
+        <button type="submit">Buscar</button>
+    </form>
+    <iframe name="result" style="width:100%; height:150px; border:none; margin-top:10px;"></iframe>
+
+    <hr>
+    <h3>Actualizar Notas de Entrega (Drivers Only)</h3>
+    <div class="card">
+        ID Envío: <input id="sid" placeholder="1001">
+        Notas: <input id="snotes" placeholder="Escribe aquí...">
+        <button onclick="updateNotes()">Guardar</button>
+    </div>
+
+    <script>
+        function updateNotes(){
+            fetch('/api/shipping/shipment/update_notes', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({id: sid.value, notes: snotes.value})
+            }).then(r => r.json()).then(d => alert(d.msg || d.error));
+        }
+    </script>
+</body>
+</html>

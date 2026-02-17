@@ -1,0 +1,28 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>TitanCore Login</title>
+    <style>body{font-family:sans-serif; background:#f4f4f4; text-align:center;} .box{background:white; width:300px; margin:100px auto; padding:20px; border-radius:8px; box-shadow:0 0 10px rgba(0,0,0,0.1);}</style>
+</head>
+<body>
+    <div class="box">
+        <h2>Titan Logistics Login</h2>
+        <input type="text" id="u" placeholder="Username" style="width:90%; padding:10px; margin:5px;"><br>
+        <input type="password" id="p" placeholder="Password" style="width:90%; padding:10px; margin:5px;"><br>
+        <button onclick="doLogin()" style="width:96%; padding:10px; background:#2c3e50; color:white; border:none; cursor:pointer;">Entrar</button>
+        <p id="msg" style="color:red;"></p>
+    </div>
+    <script>
+        function doLogin(){
+            fetch('/api/auth/login', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({username: u.value, password: p.value})
+            }).then(r => r.json()).then(data => {
+                if(data.status === 'success') window.location.href = '/dashboard';
+                else msg.innerText = data.error + (data.details ? ": " + data.details : "");
+            });
+        }
+    </script>
+</body>
+</html>
