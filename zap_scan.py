@@ -1,317 +1,296 @@
-import time
+"""
+OWASP ZAP DAST Scanner for Titan App.
+
+Improvements over previous version:
+- Uses ZAP HTTP Session Token API (no fragile JS auth script).
+- Pre-seeds all endpoints (including JSON POST) into the Sites tree so the
+  active scanner actually attacks them.
+- Imports an OpenAPI spec (openapi.yaml) so ZAP knows the JSON request
+  schemas and can fuzz them.
+- Enables AJAX Spider in addition to the traditional spider.
+- Forces attack strength HIGH and alert threshold LOW on all active scanners
+  (the previous default MEDIUM was missing modern SQLi/RCE payloads).
+- Generates ZAP's native HTML report instead of hand-building one.
+- Exits non-zero when HIGH risk findings are detected, so the pipeline fails.
+"""
 import os
 import sys
+import time
+import json
 import requests
 from zapv2 import ZAPv2
 
-print("="*60)
-print("OWASP ZAP SCAN - Titan App (MODO COMPLETO - TIEMPO EXTENDIDO)")
-print("="*60)
+TARGET = "http://localhost:5000"
+ZAP_PROXY = "http://localhost:8080"
+SCAN_TIMEOUT_SEC = 30 * 60          # 30 minutes max for active scan
+SPIDER_TIMEOUT_SEC = 5 * 60         # 5 minutes max for spider
+AJAX_TIMEOUT_SEC = 5 * 60           # 5 minutes max for ajax spider
+CONNECT_RETRIES = 20
+CONNECT_DELAY_SEC = 3
 
-api_key = os.environ.get('ZAP_API_KEY', '')
-target = 'http://localhost:5000'
+ADMIN_USER = "admin"
+ADMIN_PASS = "admin123"
 
-print(f"[1] Target: {target}")
-print(f"[2] API Key: {'✅ OK' if api_key else '❌ NO'}")
+# Endpoints to pre-seed so the active scanner sees them.
+# (path, method, body_json)
+SEED_ENDPOINTS = [
+    ("/login",                            "GET",  None),
+    ("/dashboard",                        "GET",  None),
+    ("/admin/console",                    "GET",  None),
+    ("/api/shipping/track?code=ABC123",   "GET",  None),
+    ("/api/shipping/my_shipments",        "GET",  None),
+    ("/api/auth/login",                   "POST", {"username": "admin", "password": "admin123"}),
+    ("/api/auth/profile/1",               "GET",  None),
+    ("/api/admin/dashboard/stats",        "GET",  None),
+    ("/api/admin/system/diagnostics",     "POST", {"target_ip": "127.0.0.1"}),
+    ("/api/admin/users/delete",           "POST", {"user_id": 1}),
+    ("/api/shipping/shipment/update_notes","POST",{"id": 1, "notes": "test"}),
+]
 
-# Conectar a ZAP
-print(f"[3] Conectando a ZAP en http://localhost:8080...")
-zap = ZAPv2(apikey=api_key, proxies={'http': 'http://localhost:8080', 'https': 'http://localhost:8080'})
 
-# Intentar conectar con reintentos
-conectado = False
-for i in range(20):
+def log(stage, msg):
+    print(f"[{stage}] {msg}", flush=True)
+
+
+def wait_for_zap(zap):
+    for i in range(CONNECT_RETRIES):
+        try:
+            version = zap.core.version
+            log("ZAP", f"connected (version {version})")
+            return True
+        except Exception:
+            log("ZAP", f"waiting ({i + 1}/{CONNECT_RETRIES})")
+            time.sleep(CONNECT_DELAY_SEC)
+    log("ZAP", "ERROR: not reachable")
+    return False
+
+
+def get_auth_session():
+    """Log in to the app and return a requests.Session carrying the cookie."""
+    s = requests.Session()
+    s.proxies = {"http": ZAP_PROXY, "https": ZAP_PROXY}  # route through ZAP so it sees the login
+    s.verify = False
     try:
-        version = zap.core.version
-        print(f"    ✅ ZAP conectado. Versión: {version}")
-        conectado = True
-        break
+        r = s.post(
+            f"{TARGET}/api/auth/login",
+            json={"username": ADMIN_USER, "password": ADMIN_PASS},
+            timeout=10,
+        )
+        if r.status_code == 200 and "titan_sess_id" in s.cookies:
+            log("AUTH", f"login OK, cookie titan_sess_id={s.cookies['titan_sess_id'][:16]}...")
+            return s
+        log("AUTH", f"login failed, status={r.status_code}, body={r.text[:200]}")
     except Exception as e:
-        print(f"    ⏳ Intento {i+1}/20: ZAP no responde, esperando 3s...")
-        time.sleep(3)
+        log("AUTH", f"login error: {e}")
+    return None
 
-if not conectado:
-    print("    ❌ No se pudo conectar a ZAP")
-    sys.exit(1)
 
-# Nueva sesión
-print("[4] Creando nueva sesión...")
-zap.core.new_session(name='titan-scan-completo', overwrite=True)
+def setup_zap_session(zap, cookie_value):
+    """Tell ZAP that titan_sess_id is the session token, then store the value."""
+    site = TARGET
+    try:
+        zap.httpsessions.add_default_session_token("titan_sess_id")
+    except Exception:
+        pass  # already added
+    try:
+        zap.httpsessions.create_empty_session(site, "auth-session")
+    except Exception:
+        pass
+    zap.httpsessions.set_session_token_value(site, "auth-session", "titan_sess_id", cookie_value)
+    zap.httpsessions.set_active_session(site, "auth-session")
+    log("AUTH", "ZAP session token configured")
 
-# ============================================
-# AUTENTICACIÓN (para acceder a áreas restringidas)
-# ============================================
-print("[4.1] Autenticando en la aplicación...")
-try:
-    # Login como admin para acceder a rutas protegidas
-    session = requests.Session()
-    login_data = {"username": "admin", "password": "admin123"}
-    login_resp = session.post(f"{target}/api/auth/login", json=login_data)
-    
-    if login_resp.status_code == 200:
-        token = login_resp.cookies.get('titan_sess_id')
-        print(f"    ✅ Login exitoso como admin")
-        
-        # Configurar la autenticación en ZAP
-        print("[4.2] Configurando autenticación en ZAP...")
-        # Añadir cookie de sesión a ZAP
-        zap.core.set_option_http_state_enabled(True)
-        context_id = zap.context.new_context('titan-context')
-        
-        # Incluir todas las URLs en el contexto
-        zap.context.include_in_context('titan-context', '.*')
-        
-        # Configurar script de autenticación simple con cookie
-        script_name = 'titan-auth.js'
-        script_content = f"""
-// Authentication script for Titan App
-var Cookie = Java.type('org.apache.commons.httpclient.Cookie');
 
-function authenticate(helper, paramsValues, credentials) {{
-    var cookies = [{{
-        name: 'titan_sess_id',
-        value: '{token}',
-        domain: 'localhost',
-        path: '/'
-    }}];
-    
-    cookies.forEach(function(cookieData) {{
-        var cookie = new Cookie(cookieData.domain, cookieData.name, cookieData.value, cookieData.path, 99999999, false);
-        helper.getHttpState().addCookie(cookie);
-    }});
-    
-    return helper.prepareMessage();
-}}
-"""
-        # Guardar script temporal
-        with open('/tmp/titan-auth.js', 'w') as f:
-            f.write(script_content)
-        
-        # Cargar script en ZAP
-        zap.script.load('titan-auth', 'authentication', 'Oracle Nashorn', '/tmp/titan-auth.js')
-        zap.script.enable('titan-auth')
-        print("    ✅ Autenticación configurada en ZAP")
+def seed_endpoints(session):
+    """Pre-visit every endpoint so it appears in the Sites tree.
+
+    Without this, ZAP's active scanner has nothing to attack on JSON POST
+    routes that the spider can't discover."""
+    for path, method, body in SEED_ENDPOINTS:
+        url = TARGET + path
+        try:
+            if method == "GET":
+                r = session.get(url, timeout=5)
+            else:
+                r = session.post(url, json=body, timeout=5)
+            log("SEED", f"{method} {path} -> {r.status_code}")
+        except Exception as e:
+            log("SEED", f"{method} {path} -> ERROR {e}")
+
+
+def import_openapi(zap):
+    """If openapi.yaml exists, import it so ZAP knows JSON schemas."""
+    spec_path = os.path.join(os.path.dirname(__file__), "openapi.yaml")
+    if not os.path.isfile(spec_path):
+        log("OPENAPI", "no openapi.yaml found, skipping")
+        return
+    try:
+        zap.openapi.import_file(spec_path, TARGET)
+        log("OPENAPI", f"imported {spec_path}")
+    except Exception as e:
+        log("OPENAPI", f"import failed: {e}")
+
+
+def run_spider(zap):
+    log("SPIDER", "starting traditional spider")
+    scan_id = zap.spider.scan(TARGET)
+    deadline = time.time() + SPIDER_TIMEOUT_SEC
+    while int(zap.spider.status(scan_id)) < 100:
+        if time.time() > deadline:
+            log("SPIDER", "timeout reached, stopping")
+            zap.spider.stop(scan_id)
+            break
+        log("SPIDER", f"progress {zap.spider.status(scan_id)}%")
+        time.sleep(5)
+    log("SPIDER", f"done, URLs found: {len(zap.spider.results(scan_id))}")
+
+
+def run_ajax_spider(zap):
+    log("AJAX", "starting AJAX spider")
+    zap.ajaxSpider.scan(TARGET)
+    deadline = time.time() + AJAX_TIMEOUT_SEC
+    while zap.ajaxSpider.status == "running":
+        if time.time() > deadline:
+            log("AJAX", "timeout reached, stopping")
+            zap.ajaxSpider.stop()
+            break
+        log("AJAX", f"results so far: {zap.ajaxSpider.number_of_results}")
+        time.sleep(5)
+    log("AJAX", f"done, total results: {zap.ajaxSpider.number_of_results}")
+
+
+def tune_active_scanner(zap):
+    """Force HIGH attack strength and LOW alert threshold on all scanners."""
+    zap.ascan.set_option_host_per_scan(2)
+    zap.ascan.set_option_thread_per_host(10)
+    zap.ascan.set_option_max_scan_duration_in_mins(SCAN_TIMEOUT_SEC // 60)
+
+    # The active scan default policy is the one used when no policy name is given.
+    for scanner in zap.ascan.scanners():
+        sid = scanner["id"]
+        zap.ascan.set_scanner_attack_strength(sid, "HIGH")
+        zap.ascan.set_scanner_alert_threshold(sid, "LOW")
+    log("TUNE", "all active scanners set to HIGH strength, LOW threshold")
+
+
+def run_active_scan(zap):
+    log("ASCAN", "starting active scan")
+    scan_id = zap.ascan.scan(TARGET, recurse=True, inscopeonly=False)
+    deadline = time.time() + SCAN_TIMEOUT_SEC
+    last_progress = -1
+    while int(zap.ascan.status(scan_id)) < 100:
+        if time.time() > deadline:
+            log("ASCAN", "timeout reached, stopping")
+            zap.ascan.stop(scan_id)
+            break
+        progress = int(zap.ascan.status(scan_id))
+        if progress != last_progress:
+            log("ASCAN", f"progress {progress}%")
+            last_progress = progress
+        time.sleep(15)
+    log("ASCAN", "done")
+
+
+def collect_alerts(zap):
+    alerts = zap.core.alerts(baseurl=TARGET)
+    bucket = {"High": [], "Medium": [], "Low": [], "Informational": []}
+    for a in alerts:
+        bucket.setdefault(a.get("risk", "Informational"), []).append(a)
+    return bucket
+
+
+def write_summary(bucket):
+    summary = {
+        "high": len(bucket["High"]),
+        "medium": len(bucket["Medium"]),
+        "low": len(bucket["Low"]),
+        "info": len(bucket["Informational"]),
+        "high_alerts": [
+            {
+                "name": a.get("alert"),
+                "url": a.get("url"),
+                "param": a.get("param"),
+                "evidence": a.get("evidence"),
+                "cwe": a.get("cweid"),
+                "confidence": a.get("confidence"),
+            }
+            for a in bucket["High"]
+        ],
+    }
+    with open("zap-summary.json", "w", encoding="utf-8") as f:
+        json.dump(summary, f, indent=2)
+
+    print("\n" + "=" * 60)
+    print("SCAN SUMMARY")
+    print("=" * 60)
+    print(f"HIGH:          {summary['high']}")
+    print(f"MEDIUM:        {summary['medium']}")
+    print(f"LOW:           {summary['low']}")
+    print(f"Informational: {summary['info']}")
+    if summary["high_alerts"]:
+        print("\nHIGH risk findings:")
+        for a in summary["high_alerts"]:
+            print(f"  - {a['name']} @ {a['url']} (param={a['param']})")
+
+
+def write_reports(zap):
+    """Use ZAP's native report generation."""
+    try:
+        html = zap.core.htmlreport()
+        with open("zap-report.html", "wb") as f:
+            f.write(html.encode("utf-8") if isinstance(html, str) else html)
+        log("REPORT", "wrote zap-report.html")
+    except Exception as e:
+        log("REPORT", f"html report failed: {e}")
+    try:
+        xml = zap.core.xmlreport()
+        with open("zap-report.xml", "wb") as f:
+            f.write(xml.encode("utf-8") if isinstance(xml, str) else xml)
+        log("REPORT", "wrote zap-report.xml")
+    except Exception as e:
+        log("REPORT", f"xml report failed: {e}")
+
+
+def main():
+    print("=" * 60)
+    print("OWASP ZAP DAST Scan - Titan App")
+    print("=" * 60)
+    api_key = os.environ.get("ZAP_API_KEY", "")
+    log("INIT", f"target={TARGET}, api_key={'set' if api_key else 'empty'}")
+
+    zap = ZAPv2(apikey=api_key, proxies={"http": ZAP_PROXY, "https": ZAP_PROXY})
+    if not wait_for_zap(zap):
+        sys.exit(2)
+
+    zap.core.new_session(name="titan-scan", overwrite=True)
+
+    session = get_auth_session()
+    if session is not None:
+        cookie = session.cookies.get("titan_sess_id")
+        if cookie:
+            setup_zap_session(zap, cookie)
+        seed_endpoints(session)
     else:
-        print(f"    ⚠️ No se pudo autenticar: {login_resp.status_code}")
-except Exception as e:
-    print(f"    ⚠️ Error en autenticación: {e}")
+        # Even without auth, seed the public endpoints.
+        anon = requests.Session()
+        anon.proxies = {"http": ZAP_PROXY, "https": ZAP_PROXY}
+        anon.verify = False
+        seed_endpoints(anon)
 
-# ============================================
-# SPIDER (rastreo)
-# ============================================
-print("[5] Iniciando spider (rastreo)...")
-zap.spider.scan(target)
-time.sleep(5)
-for i in range(12):
-    status = zap.spider.status()
-    print(f"    Spider: {status}%")
-    if status == '100':
-        break
-    time.sleep(5)
+    import_openapi(zap)
+    run_spider(zap)
+    run_ajax_spider(zap)
+    tune_active_scanner(zap)
+    run_active_scan(zap)
 
-# ============================================
-# ESCANEO ACTIVO CON TIEMPO EXTENDIDO
-# ============================================
-print("[6] Iniciando escaneo activo (ataques simulados)...")
-print("    ⚠️  Este proceso puede tomar varios minutos...")
-zap.ascan.scan(target, recurse=True, inscopeonly=False)
-time.sleep(10)
+    bucket = collect_alerts(zap)
+    write_summary(bucket)
+    write_reports(zap)
 
-# ESPERAR HASTA QUE EL ESCANEO ESTÉ COMPLETO (CON TIMEOUT DE 10 MINUTOS)
-max_iterations = 60  # 60 iteraciones * 10 segundos = 10 minutos máximo
-for i in range(max_iterations):
-    status = zap.ascan.status()
-    print(f"    Escaneo activo: {status}% completado")
-    if status == '100':
-        print("    ✅ Escaneo activo completado")
-        break
-    if i == max_iterations - 1:
-        print("    ⚠️ Tiempo máximo de escaneo alcanzado (10 minutos)")
-    time.sleep(10)
+    # Fail the pipeline if any HIGH findings exist - that's the whole point.
+    if bucket["High"]:
+        sys.exit(1)
 
-# ============================================
-# OBTENER ALERTAS
-# ============================================
-print("[7] Obteniendo alertas...")
-alerts = zap.core.alerts(baseurl=target)
-high_alerts = [a for a in alerts if a.get('risk') == 'High']
-medium_alerts = [a for a in alerts if a.get('risk') == 'Medium']
-low_alerts = [a for a in alerts if a.get('risk') == 'Low']
 
-print(f"\n📊 RESULTADOS FINALES:")
-print(f"  🔴 HIGH: {len(high_alerts)}")
-print(f"  🟡 MEDIUM: {len(medium_alerts)}")
-print(f"  🟢 LOW: {len(low_alerts)}")
-print(f"  📋 TOTAL: {len(alerts)}")
-
-# Mostrar detalles de alertas HIGH si las hay
-if high_alerts:
-    print("\n🔴 ALERTAS HIGH ENCONTRADAS:")
-    for alert in high_alerts:
-        print(f"  • {alert.get('alert')} - {alert.get('url')}")
-else:
-    print("\n⚠️ No se encontraron alertas HIGH.")
-    print("   Posibles razones:")
-    print("   • El escaneo activo no tuvo tiempo suficiente para completarse")
-    print("   • Las rutas vulnerables requieren autenticación específica")
-    print("   • Los payloads de SQLi/RCE necesitan más tiempo")
-
-# ============================================
-# GENERAR REPORTE HTML
-# ============================================
-print("[8] Generando reporte HTML detallado...")
-
-html_content = f"""<!DOCTYPE html>
-<html lang="es">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>OWASP ZAP DAST Report - Titan App (COMPLETO)</title>
-    <style>
-        body {{ font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; margin: 20px; background-color: #f5f5f5; }}
-        .container {{ max-width: 1200px; margin: 0 auto; background-color: white; padding: 30px; border-radius: 10px; box-shadow: 0 0 10px rgba(0,0,0,0.1); }}
-        h1, h2, h3 {{ color: #333; }}
-        .summary {{ display: flex; justify-content: space-around; margin: 30px 0; flex-wrap: wrap; }}
-        .stat {{ text-align: center; padding: 20px; border-radius: 5px; min-width: 150px; margin: 10px; }}
-        .stat-high {{ background-color: #ffebee; }}
-        .stat-medium {{ background-color: #fff3e0; }}
-        .stat-low {{ background-color: #e8f5e9; }}
-        .stat-total {{ background-color: #e3f2fd; }}
-        .number {{ font-size: 48px; font-weight: bold; }}
-        .high {{ color: #d32f2f; }}
-        .medium {{ color: #f57c00; }}
-        .low {{ color: #388e3c; }}
-        .alert {{ margin: 20px 0; padding: 15px; border-left: 5px solid; background-color: #fafafa; border-radius: 0 5px 5px 0; }}
-        .alert-high {{ border-left-color: #d32f2f; }}
-        .alert-medium {{ border-left-color: #f57c00; }}
-        .alert-low {{ border-left-color: #388e3c; }}
-        .url {{ color: #666; font-size: 0.9em; word-break: break-all; }}
-        .solution {{ background-color: #e8f5e9; padding: 10px; margin-top: 10px; border-radius: 5px; }}
-        .timestamp {{ color: #999; text-align: right; margin-top: 30px; font-size: 0.9em; }}
-    </style>
-</head>
-<body>
-    <div class="container">
-        <h1>🔍 OWASP ZAP DAST Scan Report - Titan App (COMPLETO)</h1>
-        <p><strong>Target:</strong> {target}</p>
-        <p><strong>Fecha:</strong> {time.strftime('%Y-%m-%d %H:%M:%S')}</p>
-        <p><strong>Autenticación:</strong> {'✅ Configurada' if 'token' in locals() else '❌ No configurada'}</p>
-        <p><strong>Tiempo de escaneo:</strong> {'Completado' if status == '100' else 'Parcial'}</p>
-        
-        <div class="summary">
-            <div class="stat stat-high">
-                <div class="number high">{len(high_alerts)}</div>
-                <div>Alertas HIGH</div>
-            </div>
-            <div class="stat stat-medium">
-                <div class="number medium">{len(medium_alerts)}</div>
-                <div>Alertas MEDIUM</div>
-            </div>
-            <div class="stat stat-low">
-                <div class="number low">{len(low_alerts)}</div>
-                <div>Alertas LOW</div>
-            </div>
-            <div class="stat stat-total">
-                <div class="number">{len(alerts)}</div>
-                <div>Total Alertas</div>
-            </div>
-        </div>
-        
-        <h2>❌ Alertas de Alto Riesgo (HIGH) - {len(high_alerts)} encontradas</h2>
-"""
-
-if high_alerts:
-    for alert in high_alerts:
-        html_content += f"""
-        <div class="alert alert-high">
-            <h3>{alert.get('alert', 'N/A')}</h3>
-            <p class="url"><strong>URL:</strong> {alert.get('url', 'N/A')}</p>
-            <p><strong>Riesgo:</strong> <span class="high">{alert.get('risk', 'N/A')}</span></p>
-            <p><strong>Confianza:</strong> {alert.get('confidence', 'N/A')}</p>
-            <p><strong>Descripción:</strong> {alert.get('description', 'N/A')}</p>
-            <div class="solution">
-                <strong>Solución:</strong> {alert.get('solution', 'No disponible')}
-            </div>
-        </div>
-        """
-else:
-    html_content += "<p>⚠️ No se encontraron vulnerabilidades HIGH. Esto puede deberse a tiempo de escaneo insuficiente.</p>"
-
-html_content += f"""
-        <h2>🟡 Alertas de Riesgo Medio (MEDIUM) - {len(medium_alerts)} encontradas</h2>
-"""
-
-if medium_alerts:
-    for alert in medium_alerts:
-        html_content += f"""
-        <div class="alert alert-medium">
-            <h3>{alert.get('alert', 'N/A')}</h3>
-            <p class="url"><strong>URL:</strong> {alert.get('url', 'N/A')}</p>
-            <p><strong>Riesgo:</strong> <span class="medium">{alert.get('risk', 'N/A')}</span></p>
-            <p><strong>Confianza:</strong> {alert.get('confidence', 'N/A')}</p>
-            <p><strong>Descripción:</strong> {alert.get('description', 'N/A')}</p>
-        </div>
-        """
-else:
-    html_content += "<p>No se encontraron vulnerabilidades de riesgo medio.</p>"
-
-html_content += f"""
-        <h2>🟢 Alertas de Riesgo Bajo (LOW) - {len(low_alerts)} encontradas</h2>
-"""
-
-if low_alerts:
-    for alert in low_alerts:
-        html_content += f"""
-        <div class="alert alert-low">
-            <h3>{alert.get('alert', 'N/A')}</h3>
-            <p class="url"><strong>URL:</strong> {alert.get('url', 'N/A')}</p>
-            <p><strong>Riesgo:</strong> <span class="low">{alert.get('risk', 'N/A')}</span></p>
-            <p><strong>Confianza:</strong> {alert.get('confidence', 'N/A')}</p>
-            <p><strong>Descripción:</strong> {alert.get('description', 'N/A')}</p>
-        </div>
-        """
-else:
-    html_content += "<p>No se encontraron vulnerabilidades de riesgo bajo.</p>"
-
-html_content += f"""
-        <h2>📊 Diagnóstico del escaneo</h2>
-        <ul>
-            <li>🔐 <strong>Autenticación:</strong> {'✅ Configurada' if 'token' in locals() else '❌ No configurada'}</li>
-            <li>⏱️ <strong>Tiempo de escaneo activo:</strong> {status}% completado</li>
-            <li>🎯 <strong>Rutas que requieren más tiempo:</strong> /api/shipping/track (SQLi), /api/admin/system/diagnostics (RCE)</li>
-            <li>💡 <strong>Recomendación:</strong> Aumentar el tiempo de escaneo a 15-20 minutos para detectar SQLi</li>
-        </ul>
-        
-        <div class="timestamp">
-            Reporte generado automáticamente por GitHub Actions<br>
-            Commit: {os.popen('git rev-parse --short HEAD').read().strip() if os.path.exists('.git') else 'N/A'}
-        </div>
-    </div>
-</body>
-</html>
-"""
-
-with open('zap-report.html', 'w', encoding='utf-8') as f:
-    f.write(html_content)
-
-if os.path.exists('zap-report.html'):
-    size = os.path.getsize('zap-report.html')
-    print(f"    ✅ Reporte HTML generado: {size} bytes")
-else:
-    print("    ❌ No se pudo generar el reporte")
-    sys.exit(1)
-
-# ============================================
-# RESULTADO FINAL
-# ============================================
-print("\n" + "="*60)
-if len(high_alerts) > 0:
-    print(f"❌ PIPELINE FALLIDO: {len(high_alerts)} vulnerabilidades HIGH encontradas")
-    print(f"    SQL Injection y otras vulnerabilidades detectadas")
-    sys.exit(1)
-else:
-    print("⚠️  ADVERTENCIA: No se encontraron vulnerabilidades HIGH")
-    print("    Esto puede deberse a tiempo insuficiente de escaneo")
-    print("    El escaneo solo alcanzó el {status}% de completitud")
-    print("\n    Revisa el reporte HTML para más detalles")
-    sys.exit(0)
+if __name__ == "__main__":
+    main()
