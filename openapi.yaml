@@ -1,0 +1,135 @@
+openapi: 3.0.3
+info:
+  title: Titan Enterprise API
+  version: "4.5.0"
+  description: |
+    Intentionally vulnerable Flask app used as DAST target.
+    This spec exists so OWASP ZAP can fuzz the JSON endpoints
+    properly instead of guessing them.
+
+servers:
+  - url: http://localhost:5000
+
+paths:
+  /api/auth/login:
+    post:
+      summary: Legacy login (SQLi-vulnerable)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [username, password]
+              properties:
+                username:
+                  type: string
+                  example: admin
+                password:
+                  type: string
+                  example: admin123
+      responses:
+        '200':
+          description: success
+        '401':
+          description: invalid credentials
+
+  /api/auth/profile/{user_id}:
+    get:
+      summary: View user profile
+      parameters:
+        - in: path
+          name: user_id
+          required: true
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: success
+        '404':
+          description: not found
+
+  /api/shipping/track:
+    get:
+      summary: Track a package by code (SQLi + XSS-vulnerable)
+      parameters:
+        - in: query
+          name: code
+          required: true
+          schema:
+            type: string
+            example: ABC123
+      responses:
+        '200':
+          description: success
+
+  /api/shipping/my_shipments:
+    get:
+      summary: List shipments for the logged in user
+      responses:
+        '200':
+          description: success
+
+  /api/shipping/shipment/update_notes:
+    post:
+      summary: Update delivery notes
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [id, notes]
+              properties:
+                id:
+                  type: integer
+                  example: 1
+                notes:
+                  type: string
+                  example: test
+      responses:
+        '200':
+          description: success
+
+  /api/admin/dashboard/stats:
+    get:
+      summary: Admin dashboard stats
+      responses:
+        '200':
+          description: success
+
+  /api/admin/system/diagnostics:
+    post:
+      summary: Admin ping tool (RCE-vulnerable)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [target_ip]
+              properties:
+                target_ip:
+                  type: string
+                  example: 127.0.0.1
+      responses:
+        '200':
+          description: success
+
+  /api/admin/users/delete:
+    post:
+      summary: Delete a user (SQLi-vulnerable)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [user_id]
+              properties:
+                user_id:
+                  type: integer
+                  example: 1
+      responses:
+        '200':
+          description: success
